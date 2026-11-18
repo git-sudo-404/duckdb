@@ -1,4 +1,5 @@
 #include "duckdb/storage/table/row_group.hpp"
+#include "duckdb/common/constants.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parallel/async_result.hpp"
 #include "duckdb/transaction/commit_state.hpp"
@@ -36,6 +37,7 @@
 #include "duckdb/common/storage_compatibility.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/transaction/transaction_data.hpp"
 
 namespace duckdb {
 
@@ -479,9 +481,16 @@ unique_ptr<RowGroup> RowGroup::AlterType(RowGroupCollection &new_collection, con
 	append_chunk.Initialize(Allocator::DefaultAllocator(), append_types);
 	auto &append_vector = append_chunk.data[0];
 	Vector hashes(LogicalType::HASH);
+
+	auto &transaction_manager = DuckTransactionManager::Get(GetCollection().GetAttached());
+	VisibilityBound visibility_bound = transaction_manager.LowestVisibilityBound();
+
+	TransactionData transaction_1(transaction.GetTransactionId(), visibility_bound);
+	transaction = transaction_1;
+
 	ScanOptions options(transaction);
 	options.insert_type = InsertedScanType::ALL_ROWS;
-	options.delete_type = DeletedScanType::INCLUDE_ALL_DELETED;
+	options.delete_type = DeletedScanType::OMIT_COMMITTED_DELETES;
 	while (true) {
 		// scan the table
 		scan_chunk.Reset();
