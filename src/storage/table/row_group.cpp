@@ -1,5 +1,4 @@
 #include "duckdb/storage/table/row_group.hpp"
-#include "duckdb/common/constants.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parallel/async_result.hpp"
 #include "duckdb/transaction/commit_state.hpp"
@@ -37,7 +36,6 @@
 #include "duckdb/common/storage_compatibility.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "duckdb/transaction/transaction_data.hpp"
 
 namespace duckdb {
 
@@ -385,13 +383,26 @@ void CollectionScanState::Initialize(const QueryContext &context_p, const vector
 }
 
 bool RowGroup::InitializeScanInternal(CollectionScanState &state, SegmentNode<RowGroup> &node, idx_t vector_offset) {
-	auto payload = node.ReferenceNode();
-	if (!RefersToSameObject(*payload, *this)) {
+	auto &filters = state.GetFilterInfo();
+	if (!CheckZonemap(state.context.GetClientContext(), filters, node.GetRowStart())) {
+		return false;
+	}
+	if (!RefersToSameObject(node.GetNode(), *this)) {
 		throw InternalException("RowGroup::InitializeScan segment node mismatch");
 	}
+	D_ASSERT(state.prepared_vector.prepare_state == VectorPrepareState::NONE);
+	state.prepared_vector.Reset();
+	state.assignment_io_registered = false;
+	state.SetRowGroup(node);
+	state.vector_index = vector_offset;
 	auto row_start = node.GetRowStart();
-	const auto end_row = row_start > state.max_row ? 0 : MinValue<idx_t>(this->count, state.max_row - row_start);
-	return state.InitializeRowGroupScan(node, std::move(payload), vector_offset, end_row);
+	state.max_row_group_row = row_start > state.max_row ? 0 : MinValue<idx_t>(this->count, state.max_row - row_start);
+	if (state.max_row_group_row == 0) {
+		// exceeded row groups to scan
+		return false;
+	}
+	D_ASSERT(!state.column_scans.empty());
+	return true;
 }
 
 bool RowGroup::InitializeScanWithOffset(CollectionScanState &state, SegmentNode<RowGroup> &node, idx_t vector_offset,
@@ -468,16 +479,9 @@ unique_ptr<RowGroup> RowGroup::AlterType(RowGroupCollection &new_collection, con
 	append_chunk.Initialize(Allocator::DefaultAllocator(), append_types);
 	auto &append_vector = append_chunk.data[0];
 	Vector hashes(LogicalType::HASH);
-
-	auto &transaction_manager = DuckTransactionManager::Get(GetCollection().GetAttached());
-	VisibilityBound visibility_bound = transaction_manager.LowestVisibilityBound();
-
-	TransactionData transaction_1(transaction.GetTransactionId(), visibility_bound);
-	transaction = transaction_1;
-
 	ScanOptions options(transaction);
 	options.insert_type = InsertedScanType::ALL_ROWS;
-	options.delete_type = DeletedScanType::OMIT_COMMITTED_DELETES;
+	options.delete_type = DeletedScanType::INCLUDE_ALL_DELETED;
 	while (true) {
 		// scan the table
 		scan_chunk.Reset();
@@ -844,31 +848,33 @@ bool RowGroup::CheckZonemapSegments(CollectionScanState &state) {
 	}
 }
 
-void RowGroup::CollectScanBlocks(CollectionScanState &state, idx_t start_row, idx_t end_row,
-                                 PrefetchState &prefetch_state) const {
+bool RowGroup::RegisterScanIO(CollectionScanState &state, idx_t start_row, idx_t end_row,
+                              PrefetchState &prefetch_state) const {
+	if (!GetBlockManager().Prefetch()) {
+		return false;
+	}
 	const auto &column_ids = state.GetColumnIds();
 	for (idx_t i = 0; i < column_ids.size(); i++) {
 		GetColumn(column_ids[i]).InitializePrefetch(prefetch_state, state.column_scans[i], start_row, end_row);
 	}
+	return true;
 }
 
 void RowGroup::PrefetchScanIO(CollectionScanState &state, idx_t row_count) const {
-	if (!GetBlockManager().Prefetch()) {
-		return;
-	}
 	PrefetchState prefetch_state;
 	const idx_t start_row = state.vector_index * STANDARD_VECTOR_SIZE;
-	CollectScanBlocks(state, start_row, start_row + row_count, prefetch_state);
+	if (!RegisterScanIO(state, start_row, start_row + row_count, prefetch_state)) {
+		return;
+	}
 	GetBlockManager().buffer_manager.Prefetch(state.context, prefetch_state.blocks);
 }
 
 vector<unique_ptr<AsyncTask>> RowGroup::CollectScanIOTasks(CollectionScanState &state, idx_t row_count) const {
-	if (!GetBlockManager().Prefetch()) {
-		return vector<unique_ptr<AsyncTask>>();
-	}
 	PrefetchState prefetch_state;
 	const idx_t start_row = state.vector_index * STANDARD_VECTOR_SIZE;
-	CollectScanBlocks(state, start_row, start_row + row_count, prefetch_state);
+	if (!RegisterScanIO(state, start_row, start_row + row_count, prefetch_state)) {
+		return vector<unique_ptr<AsyncTask>>();
+	}
 	return GetBlockManager().buffer_manager.CreatePrefetchTasks(state.context, prefetch_state.blocks);
 }
 
@@ -877,11 +883,6 @@ vector<unique_ptr<AsyncTask>> RowGroup::CollectAssignmentIOTasks(CollectionScanS
 		return vector<unique_ptr<AsyncTask>>();
 	}
 	PrefetchState prefetch_state;
-	CollectAssignmentBlocks(state, prefetch_state);
-	return GetBlockManager().buffer_manager.CreatePrefetchTasks(state.context, prefetch_state.blocks);
-}
-
-void RowGroup::CollectAssignmentBlocks(CollectionScanState &state, PrefetchState &prefetch_state) const {
 	const auto &filters = state.GetFilterInfo().GetFilterList();
 	const idx_t end_row = state.max_row_group_row;
 	idx_t row = state.vector_index * STANDARD_VECTOR_SIZE;
@@ -913,9 +914,10 @@ void RowGroup::CollectAssignmentBlocks(CollectionScanState &state, PrefetchState
 		D_ASSERT(accepted_end > row);
 		const idx_t run_start = row - row % STANDARD_VECTOR_SIZE;
 		const idx_t run_end = MinValue<idx_t>(AlignValue<idx_t, STANDARD_VECTOR_SIZE>(accepted_end), end_row);
-		CollectScanBlocks(state, run_start, run_end, prefetch_state);
+		RegisterScanIO(state, run_start, run_end, prefetch_state);
 		row = run_end;
 	}
+	return GetBlockManager().buffer_manager.CreatePrefetchTasks(state.context, prefetch_state.blocks);
 }
 
 bool RowGroup::PrepareScan(ScanOptions options, CollectionScanState &state) {
@@ -1017,8 +1019,8 @@ void RowGroup::ProcessPreparedScan(ScanOptions options, CollectionScanState &sta
 		// partial scan: we have deletions or table filters
 		idx_t approved_tuple_count = count;
 		SelectionVector sel;
+		SelectionVector intersect_sel(STANDARD_VECTOR_SIZE);
 		if (has_sample_selection && count != max_count) {
-			SelectionVector intersect_sel(STANDARD_VECTOR_SIZE);
 			approved_tuple_count = IntersectSelections(state.valid_sel, count, sample_sel, sample_count, intersect_sel);
 			if (approved_tuple_count == 0) {
 				NextVector(state);
@@ -1392,7 +1394,6 @@ void RowGroup::Update(TransactionData transaction, DuckTableEntry &table_entry, 
 		WriteRows(transaction, table_entry, vector_idx, vector_start, ids + offset, count,
 		          UnsafeNumericCast<row_t>(vector_start), true, written);
 	}
-	lock_guard<mutex> update_guard(update_lock);
 	for (idx_t i = 0; i < column_ids.size(); i++) {
 		auto column = column_ids[i];
 		auto &col_data = GetColumn(column.index);
@@ -1466,15 +1467,14 @@ ColumnCheckpointInfo::ColumnCheckpointInfo(RowGroupWriteInfo &info, idx_t column
     : column_idx(column_idx), info(info) {
 }
 
-RowGroupWriteInfo::RowGroupWriteInfo(Context &context, PartialBlockManager &manager,
-                                     const vector<CompressionType> &compression_types, CheckpointOptions options_p)
-    : manager(manager), context(context), compression_types(compression_types), options(options_p) {
+RowGroupWriteInfo::RowGroupWriteInfo(PartialBlockManager &manager, const vector<CompressionType> &compression_types,
+                                     CheckpointOptions options_p)
+    : manager(manager), compression_types(compression_types), options(options_p) {
 }
 
-RowGroupWriteInfo::RowGroupWriteInfo(Context &context, PartialBlockManager &manager,
-                                     const vector<CompressionType> &compression_types,
+RowGroupWriteInfo::RowGroupWriteInfo(PartialBlockManager &manager, const vector<CompressionType> &compression_types,
                                      vector<unique_ptr<PartialBlockManager>> &column_partial_block_managers_p)
-    : manager(manager), context(context), compression_types(compression_types), options(),
+    : manager(manager), compression_types(compression_types), options(),
       column_partial_block_managers(column_partial_block_managers_p) {
 }
 
@@ -1483,10 +1483,6 @@ PartialBlockManager &RowGroupWriteInfo::GetPartialBlockManager(idx_t column_idx)
 		return *column_partial_block_managers->at(column_idx);
 	}
 	return manager;
-}
-
-Context &ColumnCheckpointInfo::GetContext() {
-	return info.context;
 }
 
 PartialBlockManager &ColumnCheckpointInfo::GetPartialBlockManager() {
@@ -1734,8 +1730,7 @@ RowGroupWriteData RowGroup::WriteToDisk(RowGroupWriter &writer) {
 		}
 	}
 
-	RowGroupWriteInfo info(writer.GetTableWriter().GetContext(), writer.GetPartialBlockManager(), compression_types,
-	                       writer.GetCheckpointOptions());
+	RowGroupWriteInfo info(writer.GetPartialBlockManager(), compression_types, writer.GetCheckpointOptions());
 
 	vector<idx_t> reused_columns;
 	for (idx_t column_idx = 0; column_idx < GetColumnCount(); column_idx++) {
@@ -1764,7 +1759,7 @@ RowGroupWriteData RowGroup::WriteToDisk(RowGroupWriter &writer) {
 				auto col_stats = columns[column_idx]->GetStatistics();
 				result.statistics.push_back(col_stats
 				                                ? std::move(*col_stats)
-				                                : BaseStatistics::CreateEmpty(GetCollection().GetTypes()[column_idx]));
+												: BaseStatistics::CreateEmpty(GetCollection().GetTypes()[column_idx]));
 			}
 		} else {
 			// checkpoint this column
